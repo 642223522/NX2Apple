@@ -1,0 +1,70 @@
+name: Pack game (NX2Apple test)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    runs-on: xcode-27
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.RELAY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download inputs from relay repo
+        run: |
+          set -eux
+          mkdir -p inputs game keys
+          gh release download ff-resonance --repo 642223522/game-relay --dir inputs
+          ls -la inputs
+          cat inputs/base.nsp.part-* > game/base.nsp
+          cp inputs/update.nsp inputs/dlc1.nsp inputs/dlc2.nsp inputs/dlc3.nsp game/
+          cp inputs/prod.keys keys/prod.keys
+          ls -la game keys
+
+      - name: Sync engine
+        run: python3 tools/engine.py sync
+
+      - name: Brew tools
+        run: brew bundle --file=Brewfile
+
+      - name: Python venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz backports.zstd
+
+      - name: Build IPA (separate romfs, game icon)
+        run: |
+          set -eux
+          mkdir -p out
+          # iPhone Duo (foldable, 1.43:1 inner screen): never stretch, never crop.
+          # fit = true 16:9 picture with bars; screen aspect auto = use the
+          # engine's taller-shape extension if the game profile gains it.
+          printf 'DM_PICTURE_FIT=fit\nDM_SCREEN_ASPECT=auto\n' > env.txt
+          .venv/bin/python engine/scripts/build_ipa_from_nsp.py game -k keys/prod.keys \
+            --title-id 0100B8A026F14000 --romfs separate -l zh-Hant --env-file env.txt \
+            -o out/ff-resonance.ipa \
+            2>&1 | tee build.log
+          find . -name '*.ipa' -o -name 'romfs.img' | head -20
+          ls -la out
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p deliver
+          find . -name '*.ipa' -exec cp {} deliver/ \; 2>/dev/null || true
+          find . -name 'romfs.img' -exec cp {} deliver/ \; 2>/dev/null || true
+          cp build.log deliver/ 2>/dev/null || true
+          ls -la deliver
+
+      - name: Upload deliverables
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx2apple-ff-resonance
+          path: deliver/
+          retention-days: 3
+          if-no-files-found: warn
