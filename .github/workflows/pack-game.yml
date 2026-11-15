@@ -13,6 +13,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          # Attempt 3 (43765937663) died of disk-full in the Build step: the
+          # runner could not even write its own diag log, and no logs or
+          # artifacts survived. Peak usage is ~35 GB (9 GB base.nsp + 8.4 GB
+          # extracted + ~8.6 GB romfs.img + engine/build), so reclaim space
+          # up front and never keep two copies of the 9 GB base.
+          # Simulator runtimes + caches are the biggest safe reclaim.
+          sudo rm -rf /Library/Developer/CoreSimulator/* ~/Library/Developer/CoreSimulator/* 2>/dev/null || true
+          rm -rf ~/Library/Caches/* /Users/runner/.cache/* 2>/dev/null || true
+          # Drop every Xcode except the one this build selects (27.1, per
+          # build.log); each Xcode install is ~15 GB.
+          ls -d /Applications/Xcode*.app 2>/dev/null | grep -v 'Xcode_27.1.app' | xargs -r sudo rm -rf || true
+          brew cleanup --prune=all -s 2>/dev/null || true
+          df -h /
+
       - name: Download inputs from relay repo
         run: |
           set -eux
@@ -20,9 +38,13 @@ jobs:
           gh release download ff-resonance --repo 642223522/game-relay --dir inputs
           ls -la inputs
           cat inputs/base.nsp.part-* > game/base.nsp
-          cp inputs/update.nsp inputs/dlc1.nsp inputs/dlc2.nsp inputs/dlc3.nsp game/
+          # Drop the 9 GB parts the moment the single copy exists.
+          rm -f inputs/base.nsp.part-*
+          mv inputs/update.nsp inputs/dlc1.nsp inputs/dlc2.nsp inputs/dlc3.nsp game/
           cp inputs/prod.keys keys/prod.keys
+          rm -rf inputs
           ls -la game keys
+          df -h /
 
       - name: Sync engine
         run: python3 tools/engine.py sync
@@ -44,6 +66,10 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p out
+          # Disk watcher: if the runner dies of disk-full again, the
+          # 5-minute df snapshots in df-watch.log survive via the deliver
+          # artifact (the build log alone did not survive attempt 3).
+          (while true; do date -u '+%Y-%m-%dT%H:%M:%SZ'; df -h /; sleep 300; done > df-watch.log 2>&1 &)
           # iPhone Duo (foldable, 1.43:1 inner screen): never stretch, never crop.
           # fit = true 16:9 picture with bars; screen aspect auto = use the
           # engine's taller-shape extension if the game profile gains it.
@@ -58,6 +84,7 @@ jobs:
             2>&1 | tee build.log
           find . -name '*.ipa' -o -name 'romfs.img' | head -20
           ls -la out
+          df -h /
 
       - name: Collect outputs
         if: always()
@@ -66,6 +93,7 @@ jobs:
           find . -name '*.ipa' -exec cp {} deliver/ \; 2>/dev/null || true
           find . -name 'romfs.img' -exec cp {} deliver/ \; 2>/dev/null || true
           cp build.log deliver/ 2>/dev/null || true
+          cp df-watch.log deliver/ 2>/dev/null || true
           ls -la deliver
 
       - name: Upload deliverables
