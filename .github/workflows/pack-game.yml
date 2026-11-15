@@ -34,7 +34,11 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz backports.zstd
+          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz
+          # backports.zstd only exists for Python < 3.14 (engine uses stdlib
+          # compression.zstd on 3.14+); the runner's python3 is 3.15, where no
+          # backports.zstd release installs. Install it only when needed.
+          .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info < (3, 14) else 1)" && .venv/bin/python -m pip install backports.zstd || true
 
       - name: Build IPA (separate romfs, game icon)
         run: |
