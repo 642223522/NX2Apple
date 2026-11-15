@@ -42,14 +42,18 @@ jobs:
 
       - name: Build IPA (separate romfs, game icon)
         run: |
-          set -eux
+          set -euxo pipefail
           mkdir -p out
           # iPhone Duo (foldable, 1.43:1 inner screen): never stretch, never crop.
           # fit = true 16:9 picture with bars; screen aspect auto = use the
           # engine's taller-shape extension if the game profile gains it.
           printf 'DM_PICTURE_FIT=fit\nDM_SCREEN_ASPECT=auto\n' > env.txt
+          # Runner has Xcode 27.1 Metal (32023.921); the shader chain was tested
+          # with Xcode 27.2 (32023.922). --allow-other-metal is the engine's own
+          # escape hatch for this (other games ship builds made this way).
           .venv/bin/python engine/scripts/build_ipa_from_nsp.py game -k keys/prod.keys \
             --title-id 0100B8A026F14000 --romfs separate -l zh-Hant --env-file env.txt \
+            --allow-other-metal \
             -o out/ff-resonance.ipa \
             2>&1 | tee build.log
           find . -name '*.ipa' -o -name 'romfs.img' | head -20
@@ -72,4 +76,3 @@ jobs:
           path: deliver/
           retention-days: 3
           if-no-files-found: warn
-
