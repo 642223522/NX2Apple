@@ -66,10 +66,26 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p out
-          # Disk watcher: if the runner dies of disk-full again, the
-          # 5-minute df snapshots in df-watch.log survive via the deliver
-          # artifact (the build log alone did not survive attempt 3).
-          (while true; do date -u '+%Y-%m-%dT%H:%M:%SZ'; df -h /; sleep 300; done > df-watch.log 2>&1 &)
+          # Attempt 4 (43775864335) died in this step with the runner gone:
+          # job cancelled, no logs, no artifacts, annotation "repository
+          # invocation blocked" — the same no-evidence signature as the
+          # proven disk-full death in attempt 3, but 32 min into the build
+          # instead of 87, so memory pressure (7 GiB runner, J=3 shader
+          # workers) is equally suspect. Two fixes: (1) stream the evidence
+          # OFF the runner — every 2 min upload a snapshot (df, vm_stat,
+          # top RSS, build.log tail) to the private relay release, where it
+          # survives even if the runner is killed; (2) cap shader workers
+          # (J=2) and drop the extracted files at the end
+          # (--no-keep-extracted) to lower peak memory/disk.
+          (while true; do
+            { date -u '+%Y-%m-%dT%H:%M:%SZ'; df -h /; echo '--- vm_stat ---'; vm_stat | head -20; echo '--- top RSS ---'; ps -ax -o rss=,comm= | sort -rn | head -12; echo '--- build.log tail ---'; tail -30 build.log 2>/dev/null; } > watch.log 2>&1
+            gh release upload ff-resonance --repo 642223522/game-relay --clobber watch.log >/dev/null 2>&1 || true
+            sleep 120
+          done &)
+          # J is shader_split.py's / dmsh_build.py's worker count
+          # (build_ipa_from_nsp.py defaults it to cpu_count); 2 caps peak
+          # memory on the 7 GiB runner at some cost in shader-stage time.
+          export J=2
           # iPhone Duo (foldable, 1.43:1 inner screen): never stretch, never crop.
           # fit = true 16:9 picture with bars; screen aspect auto = use the
           # engine's taller-shape extension if the game profile gains it.
@@ -79,7 +95,7 @@ jobs:
           # escape hatch for this (other games ship builds made this way).
           .venv/bin/python engine/scripts/build_ipa_from_nsp.py game -k keys/prod.keys \
             --title-id 0100B8A026F14000 --romfs separate -l zh-Hant --env-file env.txt \
-            --allow-other-metal \
+            --allow-other-metal --no-keep-extracted \
             -o out/ff-resonance.ipa \
             2>&1 | tee build.log
           find . -name '*.ipa' -o -name 'romfs.img' | head -20
@@ -93,7 +109,7 @@ jobs:
           find . -name '*.ipa' -exec cp {} deliver/ \; 2>/dev/null || true
           find . -name 'romfs.img' -exec cp {} deliver/ \; 2>/dev/null || true
           cp build.log deliver/ 2>/dev/null || true
-          cp df-watch.log deliver/ 2>/dev/null || true
+          cp watch.log deliver/ 2>/dev/null || true
           ls -la deliver
 
       - name: Upload deliverables
