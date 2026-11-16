@@ -1,0 +1,152 @@
+# Codemagic pipeline: pack FINAL FANTASY RESONANCE (0100B8A026F14000) with
+# NX2Apple/nxnative into a standalone unsigned IPA + separate romfs.img.
+# Adapted from the GitHub Actions workflow (attempt-5) for Codemagic's free
+# plan: Mac mini M2, 120-minute per-build cap, 500 free minutes/month.
+# Inputs come from the private relay repo (642223522/game-relay, release
+# ff-resonance) and outputs go back to release ff-resonance-out there,
+# because Codemagic's own artifact storage cannot hold an ~8.6 GB romfs.img.
+# RELAY_TOKEN lives in the Codemagic environment group "relay": a
+# fine-grained GitHub PAT scoped to game-relay only (Contents read/write).
+workflows:
+  ff-resonance:
+    name: FF Resonance pack (NX2Apple)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.0
+      groups:
+        - relay
+    scripts:
+      - name: Disk and toolchain check
+        script: |
+          df -h /
+          xcodebuild -version
+          python3 --version
+          df -h /
+
+      - name: Download inputs from relay repo
+        script: |
+          set -eux
+          mkdir -p inputs game keys
+          curl -s -H "Authorization: Bearer $RELAY_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/642223522/game-relay/releases/tags/ff-resonance \
+            -o release.json
+          python3 - <<'PYEOF'
+          import json
+          d = json.load(open('release.json'))
+          with open('assets.txt', 'w') as f:
+              for a in d['assets']:
+                  f.write(f"{a['id']} {a['name']}\n")
+          print(len(d['assets']), 'assets')
+          PYEOF
+          while read -r aid aname; do
+            curl -L --retry 3 -H "Authorization: Bearer $RELAY_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "https://api.github.com/repos/642223522/game-relay/releases/assets/$aid" \
+              -o "inputs/$aname"
+          done < assets.txt
+          ls -la inputs
+          cat inputs/base.nsp.part-* > game/base.nsp
+          rm -f inputs/base.nsp.part-*
+          mv inputs/update.nsp inputs/dlc1.nsp inputs/dlc2.nsp inputs/dlc3.nsp game/
+          cp inputs/prod.keys keys/prod.keys
+          rm -rf inputs release.json assets.txt
+          ls -la game keys
+          df -h /
+
+      - name: Sync engine
+        script: |
+          set -eux
+          python3 tools/engine.py sync
+
+      - name: Brew tools
+        script: |
+          set -eux
+          brew bundle --file=Brewfile
+
+      - name: Python venv
+        script: |
+          set -eux
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz
+          # backports.zstd only exists for Python < 3.14 (engine uses stdlib
+          # compression.zstd on 3.14+); install it only when needed.
+          .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info < (3, 14) else 1)" && .venv/bin/python -m pip install backports.zstd || true
+
+      - name: Build IPA (separate romfs, game icon)
+        script: |
+          set -euxo pipefail
+          mkdir -p out
+          # J = shader worker count. The M2 machine has ~12 GB RAM (GitHub's
+          # 7 GiB runner needed J=2); J=3 balances speed vs peak memory.
+          export J=3
+          # iPhone Duo (foldable, 1.43:1 inner screen): never stretch, never
+          # crop. fit = true 16:9 picture with bars; screen aspect auto = use
+          # the engine's taller-shape extension if the profile gains it.
+          printf 'DM_PICTURE_FIT=fit\nDM_SCREEN_ASPECT=auto\n' > env.txt
+          # Codemagic's Xcode 27.0 Metal differs from the 27.2 the shader
+          # chain was tested with; --allow-other-metal is the engine's own
+          # escape hatch (other games ship builds made this way).
+          .venv/bin/python engine/scripts/build_ipa_from_nsp.py game -k keys/prod.keys \
+            --title-id 0100B8A026F14000 --romfs separate -l zh-Hant --env-file env.txt \
+            --allow-other-metal --no-keep-extracted \
+            -o out/ff-resonance.ipa \
+            2>&1 | tee build.log
+          find . -name '*.ipa' -o -name 'romfs.img' | head -20
+          ls -la out
+          df -h /
+
+      - name: Collect outputs and upload to relay
+        script: |
+          set -ux
+          mkdir -p deliver
+          find . -name '*.ipa' -exec cp {} deliver/ \; 2>/dev/null
+          find . -name 'romfs.img' -exec cp {} deliver/ \; 2>/dev/null
+          cp build.log deliver/ 2>/dev/null
+          ls -la deliver
+          # Split romfs.img into <=1800 MiB parts (release assets cap at 2 GB).
+          if [ -f deliver/romfs.img ]; then
+            (cd deliver && split -b 1800m romfs.img romfs.img.part- && rm romfs.img)
+          fi
+          ls -la deliver
+          # Get or create the output release, clearing any previous assets.
+          REL_ID=$(curl -s -H "Authorization: Bearer $RELAY_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/642223522/game-relay/releases/tags/ff-resonance-out \
+            | python3 -c "import sys, json; print(json.load(sys.stdin).get('id', ''))")
+          if [ -z "$REL_ID" ]; then
+            REL_ID=$(curl -s -X POST -H "Authorization: Bearer $RELAY_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/642223522/game-relay/releases \
+              -d '{"tag_name":"ff-resonance-out","name":"最终幻想：共鸣 打包产物（Codemagic）","body":"NX2Apple / Codemagic 打包产物：未签名 IPA + romfs.img 分片（1800 MiB/片，合并后校验大小）。"}' \
+              | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+          else
+            curl -s -H "Authorization: Bearer $RELAY_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/642223522/game-relay/releases/$REL_ID/assets" \
+              | python3 -c "
+          import sys, json, os, urllib.request
+          token = os.environ['RELAY_TOKEN']
+          for a in json.load(sys.stdin):
+              req = urllib.request.Request(f\"https://api.github.com/repos/642223522/game-relay/releases/assets/{a['id']}\", method='DELETE', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'})
+              urllib.request.urlopen(req)
+              print('deleted old asset', a['name'])
+          "
+          fi
+          echo "output release id: $REL_ID"
+          for f in deliver/*; do
+            n=$(basename "$f")
+            echo "uploading $n ($(stat -f%z "$f") bytes)"
+            curl -s -X POST -H "Authorization: Bearer $RELAY_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/642223522/game-relay/releases/$REL_ID/assets?name=$n" \
+              | python3 -c "import sys, json; d = json.load(sys.stdin); print(' ->', d.get('name'), d.get('size'), d.get('state'))"
+          done
+          echo "ALL UPLOADS DONE"
+
+    artifacts:
+      - out/*.ipa
+      - build.log
